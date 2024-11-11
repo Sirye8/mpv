@@ -1,2 +1,2 @@
 # mpv
-my mpv configuration
+shitty mpv config optimized for anime
