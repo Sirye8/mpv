@@ -2,9 +2,10 @@
 
 from typing import Any
 
-import lvsfunc as lvf
+#import lvsfunc as lvf
 import vapoursynth as vs
 from vsutil import depth, get_depth, join, plane, scale_value
+from vsdeband import deband_detail_mask
 
 core = vs.core
 
@@ -56,7 +57,8 @@ if video_in_dh <= 810:
 
 vid = depth(video_in, 16)
 
-detail_mask = lvf.mask.detail_mask(vid, brz_a=0.045, brz_b=0.06)
+detail_mask = deband_detail_mask(vid, brz=(0.045,0.06))
 deband = debander(vid, luma_grain=4.0, **deband_args)
 deband = core.std.MaskedMerge(deband, vid, detail_mask)
-depth(deband, get_depth(video_in)).set_output()
+grain = core.grain.Add(deband, 2, constant=True)
+depth(grain, get_depth(video_in)).set_output()
