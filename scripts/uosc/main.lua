@@ -328,6 +328,14 @@ function create_default_menu_items()
 				{title = t('Update uosc'), value = 'script-binding uosc/update'},
 			},
 		},
+		{
+			title = t('Profiles'),
+			items = {
+				{title = t('Toggle Simulcast'), value = 'script-message cycle-profiles "simulcast;simulcast-no"'},
+				{title = t('Toggle Enhance'), value = 'script-message cycle-profiles "enhance;enhance-no"'},
+				{title = t('Toggle Downmix'), value = 'script-message cycle-profiles "downmix;downmix-no"'},
+			},
+		},
 		{title = t('Quit'), value = 'quit'},
 	}
 end
