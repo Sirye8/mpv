@@ -216,8 +216,17 @@ mp.register_event("end-file", function(e)
     if e.reason == "quit" or e.reason == "error" then return end
     is_file_changing = true
     
+    if update_timer then 
+        update_timer:kill() 
+        update_timer = nil
+    end
+
     if persist_profiles then
-        profile_snapshot = get_cycle_opts()
+        profile_snapshot = {}
+        for k, v in pairs(last_states) do
+            profile_snapshot[k] = v
+        end
+
     else
         profile_snapshot = {}
         -- Manually force all active profiles to their "-no" state to bypass 
