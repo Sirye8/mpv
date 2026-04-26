@@ -328,14 +328,7 @@ function create_default_menu_items()
 				{title = t('Update uosc'), value = 'script-binding uosc/update'},
 			},
 		},
-		{
-			title = t('Profiles'),
-			items = {
-				{title = t('Toggle Simulcast'), value = 'script-message cycle-profiles "simulcast;simulcast-no"'},
-				{title = t('Toggle Enhance'), value = 'script-message cycle-profiles "enhance;enhance-no"'},
-				{title = t('Toggle Downmix'), value = 'script-message cycle-profiles "downmix;downmix-no"'},
-			},
-		},
+		{title = t('Profiles'), value = 'script-binding uosc/profiles'},
 		{title = t('Quit'), value = 'quit'},
 	}
 end
@@ -1134,6 +1127,69 @@ end)
 bind_command('update', function()
 	if not Elements:has('updater') then require('elements/Updater'):new() end
 end)
+
+bind_command('profiles', create_self_updating_menu_opener({
+	title = t('Profiles'),
+	type = 'profiles',
+	list_prop = 'script-opts',
+	serializer = function(script_opts)
+		local items = {}
+		if type(script_opts) ~= 'table' then script_opts = {} end
+
+		-- 1. Add the Persistence Toggle at the top of the menu
+		local is_persist = mp.get_property_native("user-data/persist_profiles") == true
+		items[1] = {
+			title = t('Persist Across Playlist'),
+			value = '!persist',
+			icon = is_persist and 'check_box' or 'check_box_outline_blank',
+			keep_open = true, -- Clicking this won't close the menu
+		}
+
+		-- 2. Fetch all profiles from mpv's internal list
+		local profiles = mp.get_property_native('profile-list') or {}
+		local profile_names = {}
+		for _, p in ipairs(profiles) do
+			profile_names[p.name] = true
+		end
+		
+		-- 3. Smart Discovery: Find cycleable pairs
+		local cycleable = {}
+		for name, _ in pairs(profile_names) do
+			if name:sub(-3) == "-no" then
+				local base = name:sub(1, -4)
+				if profile_names[base] then
+					table.insert(cycleable, base)
+				end
+			end
+		end
+		table.sort(cycleable)
+
+		-- 4. Build the dynamic profile items
+		for _, base in ipairs(cycleable) do
+			local title = base:gsub("^%l", string.upper)
+			local opt_val = script_opts["cycle-" .. base]
+			local is_active = (opt_val ~= "null" and opt_val ~= "" and opt_val ~= nil)
+			
+			items[#items + 1] = {
+				title = title,
+				value = base,
+				active = is_active,
+			}
+		end
+		
+		return items
+	end,
+	on_activate = function(event)
+		if event.value == '!persist' then
+			-- Trigger the persistence toggle
+			mp.commandv('script-message', 'toggle-profile-persistence')
+		else
+			-- Trigger the standard profile toggle
+			local p = event.value
+			mp.commandv('script-message', 'cycle-profiles', p .. ';' .. p .. '-no')
+		end
+	end,
+}))
 
 --[[ MESSAGE HANDLERS ]]
 
