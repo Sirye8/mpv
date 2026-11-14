@@ -48,6 +48,7 @@ local database = utils.join_path(directory, "data.sqlite3")
 local legacy_database = utils.join_path(base, "rich-presence/data.sqlite3")
 local modules = utils.join_path(directory, "modules")
 local config = utils.join_path(base, "script-opts/rich-presence.conf")
+options.settings_export_path=utils.join_path(base,"rich-presence-settings.json")
 local windows = package.config:sub(1,1) == "\\"
 local bundled = windows and utils.join_path(directory, "runtime/python.exe")
 options.bundled_fpcalc = utils.file_info(utils.join_path(directory, windows and "runtime/fpcalc.exe" or "runtime/fpcalc")) ~= nil

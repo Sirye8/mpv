@@ -6,7 +6,8 @@ return function(make_sheet, send, options, help)
         {"original","Original"},{"local","Local only"},{"tmdb-movie","TMDB movies"},{"tmdb-tv","TMDB TV"},{"tvmaze","TVmaze"},
         {"wikidata","Wikidata"},{"musicbrainz","MusicBrainz"},{"acoustid","AcoustID"},{"stream","Stream metadata"},
     }
-    local snap, draft, pending, scope = {}, {}, nil, "global"
+    local snap, draft, pending = {}, {}, nil
+    local scopes={}
     local layout, replace = "all", false
     local themes={
         glass={background="030405",accent="AFD9FF",opacity=87,blur=true,strength=6},
@@ -14,6 +15,19 @@ return function(make_sheet, send, options, help)
         graphite={background="101113",accent="C9DEDA",opacity=100,blur=false,strength=6},
     }
     local theme_names={glass="Dark glass",midnight="Midnight",graphite="Graphite",custom="Custom"}
+    local blur_names={classic="Classic",gaussian="Gaussian",box="Box"}
+    local layout_names={all="All media",anime="Anime",audio="Audio",video="Video",movie="Movies",
+        tv="TV",recording="Music recordings",stream="Streams"}
+    local source_help={inherit="Use the inherited recognition settings.",auto="Match anime, movies, TV or music automatically.",
+        anime="Use AniList for anime.",["movie-tv"]="Look for movies and TV episodes.",movie="Look for movies only.",tv="Look for TV only.",
+        original="Use the original local card and AniList matching.",["local"]="Use local metadata without a new provider search.",
+        ["tmdb-movie"]="Look for movies with TMDB.",["tmdb-tv"]="Look for TV with TMDB.",tvmaze="Look for TV with TVmaze.",
+        wikidata="Look for movies with Wikidata.",musicbrainz="Use MusicBrainz for music tags.",acoustid="Use AcoustID for local audio fingerprints.",
+        stream="Use public metadata from supported streams."}
+    local layout_help={all="Use the defaults for every media type.",anime="Override the card for recognized anime.",
+        audio="Override the card for local audio without a recording match.",video="Override the card for local or unmatched video.",
+        movie="Override the card for recognized movies.",tv="Override the card for recognized TV episodes.",
+        recording="Override the card for matched music recordings.",stream="Override the card for supported streams."}
     local function appearance_edit(key,value)
         draft[key]=value
         draft.custom=true
@@ -27,7 +41,7 @@ return function(make_sheet, send, options, help)
     local record
     local ui
     local saved_groups={
-        {"Saved profiles",{"appearance","privacy","exclude","sources","tracking","panel","panel-theme","folder-filter","recognition-options"}},
+        {"Saved profiles",{"appearance","privacy","exclude","sources","tracking","panel","panel-theme","folder-filter","recognition-options","save-scopes","watch-retention"}},
         {"Saved matches",{"match","provider","tv-rule"}},
         {"Saved caches",{"cache"}},
         {"Saved AniList data",{"watch","pending","skipped","history","entry"}},
@@ -40,6 +54,8 @@ return function(make_sheet, send, options, help)
         tracking={"Tracking preferences","AniList mode, threshold and Ask preferences saved for each scope. Watch history has its own category."},
         panel={"Panel settings","The saved panel position and optional Discord pin handoff. Clearing this record uses the default for each."},
         ["panel-theme"]={"Panel theme","The saved panel palette, opacity and blur. Clearing this record restores Dark glass."},
+        ["save-scopes"]={"Saved scope selections","The Save for choice remembered separately by each settings page. Clearing it restores each page's initial choice."},
+        ["watch-retention"]={"Watch retention settings","The number of months local watch records are kept without playback activity. Clearing it restores the three-month default."},
         ["folder-filter"]={"Folder filter override","The saved folder filter mode or list. Removing it restores both values from rich-presence.conf."},
         ["recognition-options"]={"Optional recognition settings","Clear the switches for conditional TV folder rules and local metadata files. Saved rules and the sidecar files stay available."},
         ["tv-rule"]={"TV folder rules","Saved series identities and approved filename titles for an exact folder. Removing a folder record removes its rules. File-specific matches stay available."},
@@ -88,7 +104,7 @@ return function(make_sheet, send, options, help)
     local cached_theme, theme_key
     local function panel_theme()
         local config=theme_settings()
-        local key=table.concat({config.background,config.accent,config.opacity,tostring(config.blur),config.strength},":")
+        local key=table.concat({config.background,config.accent,config.opacity,tostring(config.blur),config.strength,config.method or "classic"},":")
         if key==theme_key then return cached_theme end
         local function bgr(rgb) return rgb:sub(5,6)..rgb:sub(3,4)..rgb:sub(1,2) end
         local function tint(first,second,fraction)
@@ -111,7 +127,7 @@ return function(make_sheet, send, options, help)
             text=readable,muted=light(background) and "35302C" or "C2B8AD",
             accent=bgr(accent),ink=light(accent) and "1B1008" or "F7F3EF",rim="ABA096",
             switch=tint(background,accent,.42),hint=tint(background,"202835",.65),
-            opacity=config.opacity/100,blur=config.blur,strength=config.strength}
+            opacity=config.opacity/100,blur=config.blur,strength=config.strength,method=config.method}
         return cached_theme
     end
     local function request(action,fields)
@@ -131,9 +147,9 @@ return function(make_sheet, send, options, help)
         args.notice_page=args.notice_page or ui.page
         request("service",{job=args})
     end
-    local function start_search(provider,query)
+    local function start_search(provider,query,scope)
         search_number=search_number+1
-        search={id=tostring(search_number),provider=provider,query=query,session=snap.session}
+        search={id=tostring(search_number),provider=provider,query=query,session=snap.session,scope=scope}
         service("search",{provider=provider,query=query,request=search.id,notice_page="Search results"})
         if ui.page~="Search results" then ui.push("Search results") else ui.draw() end
     end
@@ -155,13 +171,30 @@ return function(make_sheet, send, options, help)
         pending={label=label,run=fn,session=snap.session,account=(snap.account or {}).generation}
         ui.push("Confirm")
     end
-    local function apply(cat,values,target)
-        request("apply",{category=cat,values=values,scope=target or scope,replace=cat=="appearance" and replace and layout=="all"})
-        refresh()
+    local function scope_available(scope)
+        return scope=="global" or (scope=="folder" and snap.has_local_folder)
+            or (scope=="file" and snap.has_file)
     end
-    local function pick(page) if page=="Recognition & folders" and scope=="global" then scope="file" end; if page=="Appearance" then draft={}; replace=false end; ui.push(page) end
+    local function get_scope(page)
+        if page=="Search results" then return search and search.scope or "file" end
+        return scopes[page] or (snap.save_scopes or {})[page]
+            or (page=="Recognition & folders" and snap.has_file and "file" or "global")
+    end
+    local function require_scope(scope)
+        if scope_available(scope) then return true end
+        notice(scope=="folder" and "Open a local file to use the Folder scope." or "Open media to use the File scope.")
+    end
+    local function pick(page) if page=="Appearance" then draft={}; replace=false end; ui.push(page) end
     local function rows(page)
         local list={}
+        local scope=get_scope(page)
+        local function apply(cat,values,target)
+            target=target or scope
+            if not require_scope(target) then return false end
+            request("apply",{category=cat,values=values,scope=target,replace=cat=="appearance" and replace and layout=="all"})
+            refresh()
+            return true
+        end
         local function row(label,fn,primary,adjust,id)
             list[#list+1]={label=label,run=fn,primary=primary,adjust=adjust,disabled=not fn,
                 id=id or label:match("^(.-)   ") or label,tip=help(label,page,fn~=nil,nil,nil,id)}
@@ -172,14 +205,23 @@ return function(make_sheet, send, options, help)
             item.link=true
             item.tip=description.." Click or press Enter to open "..(detail and url.." " or "").."in your default browser."
         end
-        local function choice(label,values,current,fn,display)
-            local function step(dir)
-                local idx=1
-                for i,v in ipairs(values) do if v==current then idx=i; break end end
-                fn(values[1+(idx-1+dir)%#values])
+        local function choice(label,values,current,fn,display,names,available,descriptions)
+            local tip=help(label,page,true,values,current)
+            local entries={}
+            for i,value in ipairs(values) do
+                local option=tip.options[i]
+                local name=(names or {})[value] or option.label
+                local disabled=available and not available(value)
+                local detail=(descriptions or {})[value] or option.detail
+                if disabled then detail=detail..(value=="folder" and " Open a local file to use this scope." or " Open media to use this scope.") end
+                entries[i]={label=name:sub(1,1):upper()..name:sub(2),value=value,selected=value==current,
+                    detail=detail,disabled=disabled}
+                option.label,option.detail=entries[i].label,detail
             end
-            local item=row(label.."   "..(display or tostring(current)),function() step(1) end,false,step)
-            item.tip=help(label,page,true,values,current)
+            local item=row(label.."   "..(display or (names or {})[current] or tostring(current)),
+                function() ui.choose(label,entries,fn) end)
+            item.dropdown,item.tip=true,tip
+            return item
         end
         local function switch(label,v,fn)
             local value=v and "On" or "Off"
@@ -188,7 +230,12 @@ return function(make_sheet, send, options, help)
             item.tip=help(label,page,true,{"On","Off"},value)
         end
         local function scope_row()
-            choice("Save for",{"global","folder","file"},scope,function(v) scope=v end)
+            choice("Save for",{"global","folder","file"},scope,function(v)
+                scopes[page]=v
+                request("apply",{category="save-scopes",values={[page]=v},scope="global"})
+                if v~=scope and page=="Appearance" then draft={}; replace=false end
+                refresh()
+            end, nil, {global="Global",folder="Folder",file="File"},scope_available)
         end
         local function toggle(label,key,default)
             local v=draft[key]
@@ -328,7 +375,7 @@ return function(make_sheet, send, options, help)
             scope_row()
             choice("Media layout",{"all","anime","audio","video","movie","tv","recording","stream"},layout,function(v)
                 layout=v; draft={}; replace=false; refresh()
-            end)
+            end,nil,layout_names,nil,layout_help)
             choice("Preset",{"original","clean","detailed","private"},opts.preset or "original",function(v)
                 replace=true; draft={preset=v}
                 refresh()
@@ -370,12 +417,15 @@ return function(make_sheet, send, options, help)
                 refresh()
             end) end)
             row("Reset saved appearance",function()
+                if not require_scope(scope) then return end
                 confirm("Clear appearance overrides for "..scope.." and show the inherited card",function()
                     request("clear",{category="appearance",scope=scope}); draft={}; replace=false; refresh()
                 end)
             end)
             row("Panel theme",function() ui.push("Panel theme") end)
-            row("Apply",function() apply("appearance",edits()); draft={}; replace=false; ui.back() end,true)
+            row("Apply",function()
+                if apply("appearance",edits()) then draft={}; replace=false; ui.back() end
+            end,true)
         elseif page=="Panel theme" then
             local config=theme_settings()
             local function save(values,reset)
@@ -391,7 +441,7 @@ return function(make_sheet, send, options, help)
             choice("Panel theme preset",{"glass","midnight","graphite","custom"},preset,function(v)
                 if v=="custom" then config.preset=v; save(config,true)
                 else save({preset=v},true) end
-            end,theme_names[preset])
+            end,theme_names[preset],theme_names)
             for _,field in ipairs({{"Background color","background"},{"Accent color","accent"}}) do
                 local name,key=field[1],field[2]
                 row(name.."   #"..config[key],function()
@@ -415,7 +465,11 @@ return function(make_sheet, send, options, help)
             end
             amount("Panel opacity","opacity",40,100,"%")
             switch("Background blur",config.blur,function() customize("blur",not config.blur) end)
-            if config.blur then amount("Blur strength","strength",2,12," px") end
+            if config.blur then
+                choice("Blur method",{"classic","gaussian","box"},config.method or "classic",
+                    function(v) customize("method",v) end,nil,blur_names)
+                amount("Blur strength","strength",2,32," px")
+            end
             row("Restore panel theme defaults",function()
                 request("clear",{category="panel-theme"}); refresh()
             end)
@@ -426,11 +480,18 @@ return function(make_sheet, send, options, help)
             local current=(snap.sources or {}).source or "auto"
             local label=current
             for _,source in ipairs(sources) do if source[1]==current then label=source[2]; break end end
-            if scope=="folder" and not snap.has_local_folder then
-                row("Open a local file to set its folder source")
-            else
-                row("Media recognition   "..label,function() ui.push("Choose source") end)
-            end
+            local values,names={"inherit"},{inherit="Inherit recognition source"}
+            for _,source in ipairs(sources) do values[#values+1]=source[1]; names[source[1]]=source[2] end
+            choice("Media recognition",values,snap.source_scope=="configuration" and "inherit" or current,function(value)
+                if not require_scope(scope) then return end
+                if value=="inherit" then
+                    confirm("Remove the recognition override for "..scope,function()
+                        request("clear",{category="sources",scope=scope}); refresh()
+                    end)
+                else
+                    confirm("Use "..names[value].." for "..scope,function() apply("sources",{source=value}) end)
+                end
+            end,snap.source_scope=="configuration" and ("Inherited · "..label) or label,names,nil,source_help)
             row("Source rule   "..(snap.source_scope or "configuration"))
             local recognition=snap.recognition_options or {}
             switch("TV folder rules",recognition.tv_rules==true,function()
@@ -444,7 +505,7 @@ return function(make_sheet, send, options, help)
             end)
             row("Provider settings and credits",function() ui.push("Providers") end)
             row("AniList search",function() ui.text("Search anime","",function(q)
-                start_search("anilist",q)
+                start_search("anilist",q,scope)
             end) end)
             row("Enter AniList ID or URL",function() ui.text("AniList ID or URL","",function(s)
                 local id=tonumber(s:match("^%d+$") or s:match("^https://anilist%.co/anime/(%d+)"))
@@ -463,26 +524,12 @@ return function(make_sheet, send, options, help)
             for _,provider in ipairs({{"tmdb-movie","TMDB movies"},{"tmdb-tv","TMDB TV"},{"tvmaze","TVmaze"},{"musicbrainz","MusicBrainz"}}) do
                 local id,name=provider[1],provider[2]
                 row("Search "..name,function() ui.text("Search "..name,"",function(q)
-                    start_search(id,q)
+                    start_search(id,q,scope)
                 end) end)
             end
             row("Fingerprint this file",function()
-                start_search("acoustid")
+                start_search("acoustid",nil,scope)
             end)
-        elseif page=="Choose source" then
-            row("Inherit recognition source",function()
-                confirm("Remove the recognition override for "..scope,function()
-                    request("clear",{category="sources",scope=scope}); refresh(); ui.back()
-                end)
-            end)
-            for _,source in ipairs(sources) do
-                local value,label=source[1],source[2]
-                row(label,function()
-                    confirm("Use "..label.." for "..scope,function()
-                        apply("sources",{source=value}); ui.back()
-                    end)
-                end)
-            end
         elseif page=="Providers" then
             link("AniList","https://anilist.co/","Supplies public anime titles, artwork and sequel links. Sign-in is only needed for list features.","Anime metadata")
             link("TMDB","https://www.themoviedb.org/","Supplies movie and TV titles, episode metadata and posters. The packaged default uses the shared service.",
@@ -501,7 +548,7 @@ return function(make_sheet, send, options, help)
             elseif result.id~=search.id then row("Searching…")
             elseif result.state=="failed" then
                 row("Search failed   "..(result.error or "Provider unavailable"))
-                row("Retry search",function() start_search(search.provider,search.query) end)
+                row("Retry search",function() start_search(search.provider,search.query,search.scope) end)
             else
                 local current=search
                 local tv=current.provider=="tmdb-tv" or current.provider=="tvmaze"
@@ -509,6 +556,7 @@ return function(make_sheet, send, options, help)
                     local hit=r
                     row(hit.title,function()
                         local target=tv and "file" or scope
+                        if not require_scope(target) then return end
                         confirm("Use "..hit.title.." for "..target,function()
                             if search~=current then return end
                             service("select",{candidate=hit,scope=target,request=current.id})
@@ -705,13 +753,15 @@ return function(make_sheet, send, options, help)
                     confirm(message,function() service("write",{base=base,target=target,status=list_status}); list_status=nil; edit=nil; edit_base=nil end)
                 end
                 choice("Status on Apply",{"unchanged","CURRENT","COMPLETED","REPEATING","PAUSED","DROPPED","PLANNING"},
-                    list_status or "unchanged",function(v) list_status=v~="unchanged" and v or nil end)
+                    list_status or "unchanged",function(v) list_status=v~="unchanged" and v or nil end,
+                    nil,list_status_labels)
                 row("Apply progress",function() submit(edit or entry.progress) end,true)
                 row("Reset progress edit",function() edit=entry.progress; edit_base=copy(entry) end)
                 if snap.watch_episode and tonumber(snap.episode) then row("Mark current episode watched",function() submit(tonumber(snap.episode)) end) end
             end
             scope_row()
-            choice("Tracking",{"off","manual","ask","auto"},mode,function(v) apply("tracking",{mode=v}) end,tracking_mode_labels[mode])
+            choice("Tracking",{"off","manual","ask","auto"},mode,function(v) apply("tracking",{mode=v}) end,
+                nil,tracking_mode_labels)
             if mode=="ask" then
                 local timing=tracking.ask_timing or "threshold"
                 choice("Ask timing",{"threshold","end","leave"},timing,function(v)
@@ -725,9 +775,17 @@ return function(make_sheet, send, options, help)
                 choice("Before leaving position",leave_positions,position,
                     function(v) apply("tracking",{ask_leave_position=v}) end,position=="center" and "Center" or position)
                 local seconds=tracking.ask_timeout or 30
-                row("Ask prompt timeout   "..(seconds==0 and "Never" or seconds.." seconds"),function()
-                    ui.push("Ask prompt timeout")
-                end)
+                local names={never="Never",["15"]="15 seconds",["30"]="30 seconds",["60"]="60 seconds",custom="Custom timeout"}
+                local current=seconds==0 and "never" or tostring(seconds)
+                choice("Ask prompt timeout",{"never","15","30","60","custom"},names[current] and current or "custom",function(v)
+                    if v~="custom" then apply("tracking",{ask_timeout=tonumber(v) or 0}); return end
+                    ui.text("Dismiss after 5 to 300 seconds",tostring(seconds>0 and seconds or 30),function(s)
+                        local value=tonumber(s)
+                        if value and value==math.floor(value) and value>=5 and value<=300 then
+                            apply("tracking",{ask_timeout=value})
+                        else notice("Enter a whole number from 5 to 300 seconds.") end
+                    end)
+                end,seconds==0 and "Never" or seconds.." seconds",names)
             end
             switch("Resume unfinished time",tracking.resume~=false,function()
                 apply("tracking",{resume=tracking.resume==false})
@@ -795,25 +853,6 @@ return function(make_sheet, send, options, help)
             end
             if #(snap.pending or {})==0 then row("No pending updates") end
             if #(snap.pending or {})>0 and visible==0 then row("No updates match the filter") end
-        elseif page=="Ask prompt timeout" then
-            local function set_timeout(value)
-                apply("tracking",{ask_timeout=value})
-                ui.back()
-            end
-            local seconds=tracking.ask_timeout or 30
-            for _,value in ipairs({0,15,30,60}) do
-                local label=value==0 and "Never" or value.." seconds"
-                local item=row(label..(seconds==value and "   Current" or ""),function() set_timeout(value) end)
-                item.tip=value==0 and "Leave the prompt open until you choose an action, Later, or the close button."
-                    or "Dismiss the prompt after "..value.." seconds and keep its update in Pending updates."
-            end
-            row("Custom timeout",function()
-                ui.text("Dismiss after 5 to 300 seconds",tostring(seconds>0 and seconds or 30),function(s)
-                    local value=tonumber(s)
-                    if value and value==math.floor(value) and value>=5 and value<=300 then set_timeout(value)
-                    else notice("Enter a whole number from 5 to 300 seconds.") end
-                end)
-            end)
         elseif page=="Saved data" then
             local counts=snap.record_counts or {}
             for _,group in ipairs(saved_groups) do
@@ -821,7 +860,35 @@ return function(make_sheet, send, options, help)
                 for _,category in ipairs(group[2]) do count=count+(counts[category] or 0) end
                 row(name.."   "..count,function() filter=""; ui.push(name) end)
             end
-            row("Reset everything",function() confirm("Clear local profiles, matches, caches and watch history, disconnect AniList, and restore the defaults from rich-presence.conf.",function() service("reset") end) end)
+            row("Settings transfer",function() ui.push("Settings transfer") end)
+            local months=(snap.watch_retention or {}).months or 3
+            row("Watch data retention   "..(months==0 and "Never expire" or months..(months==1 and " month" or " months")),function()
+                ui.text("Keep local watch data for months (0 for no expiry)",tostring(months),function(value)
+                    local n=tonumber(value)
+                    if not n or n~=math.floor(n) or n<0 or n>120 then return notice("Enter 0 to 120 months.") end
+                    apply("watch-retention",{months=n},"global")
+                    service("sweep-watch")
+                end)
+            end)
+            row("Reset all watch data",function()
+                confirm("Clear local watch timers, viewing cycles, progress history and pending updates for every account on this install? Saved settings and your AniList list entries stay as they are.",function()
+                    service("reset-watch",{notice_page="Saved data"})
+                end)
+            end)
+            row("Reset everything",function() confirm("Clear local profiles, matches, caches and watch history, disconnect AniList, and restore the defaults from rich-presence.conf.",function()
+                scopes={}; service("reset")
+            end) end)
+        elseif page=="Settings transfer" then
+            local function transfer(op,prompt)
+                ui.text(prompt,options.settings_export_path or "",function(path)
+                    if path=="" then return notice("Enter an absolute path to a JSON file.") end
+                    if op=="export-settings" then service(op,{path=path})
+                    else confirm("Import settings from "..path.."? Matching saved profiles and rules will be replaced.",
+                        function() scopes={}; service(op,{path=path,notice_page="Settings transfer"}) end) end
+                end)
+            end
+            row("Export settings",function() transfer("export-settings","Save settings to a new JSON file") end)
+            row("Import settings",function() transfer("import-settings","Open a settings JSON file") end)
         elseif category_for(page) then
             local cat=category_for(page)
             local label,description=saved_categories[cat][1],saved_categories[cat][2]
@@ -830,6 +897,7 @@ return function(make_sheet, send, options, help)
             local function clear(scope)
                 local suffix=scope and (" ("..scope..")") or " (all "..count..")"
                 confirm("Clear "..label:lower()..suffix.."? "..description,function()
+                    if cat=="save-scopes" then scopes={} end
                     service("clear",{category=cat,scope=scope,notice_page=page})
                 end)
             end
@@ -923,7 +991,12 @@ return function(make_sheet, send, options, help)
         if not ui.open then return end
         local key=tostring(value.session).."/"..tostring(value.match).."/"..tostring((value.account or {}).generation)
         if key~=edit_key then edit=nil; edit_base=nil; list_status=nil; pending=nil; draft={}; edit_key=key end
+        if (snap.session~=value.session or (snap.account or {}).generation~=(value.account or {}).generation)
+            and ui.dismiss_choices then ui.dismiss_choices(false) end
         snap=value
+        for page,scope in pairs(scopes) do
+            if (snap.save_scopes or {})[page]==scope then scopes[page]=nil end
+        end
         if ui.page=="AniList" and value.allowed and (value.match or 0)>0 and (value.account or {}).id and last_read~=key then
             last_read=key; service("read",{quiet=true})
         end

@@ -1,7 +1,8 @@
 -- SPDX-License-Identifier: AGPL-3.0-or-later
 return function(options, modules, interpreter, utils)
     local shader=utils.join_path(modules,"panel-blur.glsl")
-    local parameters={"rp_left","rp_top","rp_right","rp_bottom","rp_radius","rp_strength"}
+    local parameters={"rp_left","rp_top","rp_right","rp_bottom","rp_radius","rp_strength","rp_method"}
+    local methods={classic=0,gaussian=1,box=2}
     local active,geometry=false,nil
     local function stop_blur()
         if not active then return end
@@ -11,7 +12,7 @@ return function(options, modules, interpreter, utils)
             mp.commandv("change-list","glsl-shader-opts","remove","panel-blur/"..key)
         end
     end
-    options.backdrop=function(bounds,radius,enabled,strength)
+    options.backdrop=function(bounds,radius,enabled,strength,method)
         if not bounds or not enabled or mp.get_property("current-vo")~="gpu-next" then
             stop_blur()
             return
@@ -23,7 +24,7 @@ return function(options, modules, interpreter, utils)
             stop_blur()
             return
         end
-        local values={bounds[1]-l,bounds[2]-t,bounds[3]-l,bounds[4]-t,radius,strength or 6}
+        local values={bounds[1]-l,bounds[2]-t,bounds[3]-l,bounds[4]-t,radius,strength or 6,methods[method] or 0}
         local key=table.concat(values,",")
         if geometry==key then return end
         local args=mp.get_property_native("glsl-shader-opts") or {}
@@ -77,7 +78,10 @@ return function(options, modules, interpreter, utils)
             if avatar_url~=url then return end
             job=nil
             retry_after=mp.get_time()+60
-            if not result or result.status~=0 or #(result.stdout or "")~=16384 then return end
+            if not result or result.status~=0 or #(result.stdout or "")~=16384 then
+                mp.msg.verbose("Could not load the AniList avatar. The panel can retry in 60 seconds.")
+                return
+            end
             avatar_file=avatar_file or utils.join_path(os.getenv("TEMP") or os.getenv("TMPDIR") or "/tmp",
                 "mpv-rich-presence-avatar-"..mp.get_property("pid")..".bgra")
             local file=io.open(avatar_file,"wb")

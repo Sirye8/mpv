@@ -43,10 +43,12 @@ from providers import (
     video_query,
     generic_clip,
 )
+from settings_transfer import export_settings, import_settings, summary as import_summary
 
 PUBLIC_EXCHANGE = "https://mpv-anilist-login.si-based.workers.dev"
 MUSIC_RETRY_DELAYS = (5, 15)
 VIDEO_RETRY_DELAYS = (5, 15)
+DAY = 86400
 
 
 def tv_rule_matches(rule, titles, year, provider_id, provider):
@@ -105,11 +107,130 @@ class Worker:
         return json.loads(row[0]) if row else ({} if default is None else default)
 
     def put(self, category, scope, value):
+        if category in ("skipped", "history", "cycle") and "activity" not in value:
+            value = dict(value, activity=time.time())
         self.db.execute(
             "INSERT INTO records VALUES(?,?,?) ON CONFLICT(category,scope) "
             "DO UPDATE SET value=excluded.value WHERE records.value<>excluded.value",
             (category, scope, json.dumps(value)),
         )
+
+    def sweep_watch(self, *, force=False):
+        now = time.time()
+        if not force and now-self.get("watch-sweep", "global").get("time",0) < DAY:
+            return
+        with self.transaction():
+            if not force and now-self.get("watch-sweep", "global").get("time",0) < DAY:
+                return
+            months = self.get("watch-retention", "global").get("months", 3)
+            self.put("watch-sweep", "global", {"time":now})
+            if months == 0:
+                return
+            # Older timers and completed updates already have wall-clock dates.
+            # Undated records start their retention period when first seen.
+            cutoff = now - months * 30 * DAY
+            self.db.execute("""
+                UPDATE records SET value=json_set(value,'$.activity',coalesce(
+                    json_extract(value,'$.last_watched')/1000.0,json_extract(value,'$.time'),?))
+                WHERE category IN ('watch','pending','skipped','history','cycle')
+                  AND json_type(value,'$.activity') IS NULL
+                """, (now,))
+            cycles, series_activity = {}, {}
+            intents = {scope for (scope,) in self.db.execute("SELECT scope FROM records WHERE category='write-intent'")}
+            for category, scope, raw in self.db.execute(
+                "SELECT category,scope,value FROM records WHERE category IN ('watch','pending','skipped','history','cycle')"
+            ):
+                value = json.loads(raw)
+                parts = scope.split("/")
+                if len(parts) != (2 if category == "cycle" else 4):
+                    continue
+                series = "/".join(parts[:2])
+                number = str(value.get("number",0)) if category == "cycle" else parts[3]
+                activity = max(value.get("activity") or 0, (value.get("last_watched") or 0)/1000)
+                cycles.setdefault((series,number),[]).append((category,scope,activity))
+                series_activity[series] = max(series_activity.get(series,0),activity)
+            for (series,_), records in cycles.items():
+                if series in intents or any(activity >= cutoff for _,_,activity in records):
+                    continue
+                self.db.executemany("DELETE FROM records WHERE category=? AND scope=?", (
+                    (category,scope) for category,scope,_ in records
+                    if category != "cycle" or series_activity[series] < cutoff
+                ))
+            self.db.execute("DELETE FROM records WHERE category IN ('watch-finished','watch-completed','watch-eof') "
+                            "AND json_extract(value,'$.time') < ?", (cutoff,))
+
+    def completed_in_window(self, scope, player):
+        return player.get("session") is not None and self.get("watch-completed",scope).get("sessions",{}).get(self.window)==player["session"]
+
+    def clear_completed_watch(self, scope, entry, total=0):
+        """Called in the same transaction as the confirmed list-entry update."""
+        finished = self.get("watch-finished",scope)
+        if (entry.get("status") != "COMPLETED" or not finished or
+            entry.get("progress",0) < finished["total"] or (total and total!=finished["total"]) or
+            (finished.get("rewatch") and entry.get("repeat",0) <= finished.get("repeat",0))):
+            return False
+        sessions = {}
+        viewer,media=map(int,scope.split("/"))
+        if self.get("account","current").get("id")==viewer:
+            for window, raw in self.db.execute("SELECT scope,value FROM records WHERE category='player'"):
+                player=json.loads(raw)
+                if player.get("media")==media and player.get("session") is not None:
+                    sessions[window]=player["session"]
+        self.put("watch-completed",scope,{"sessions":sessions,"time":time.time()})
+        self.db.execute("DELETE FROM records WHERE (category IN ('watch','pending','skipped','history') AND scope LIKE ?) "
+                        "OR (category IN ('cycle','watch-finished') AND scope=?)",(scope+"/%",scope))
+        return True
+
+    def finish_watched_episode(self):
+        account=self.get("account","current")
+        if not account.get("id"):
+            return
+        events=self.db.execute("SELECT scope,value FROM records WHERE category='watch-eof'").fetchall()
+        if events:
+            with self.transaction():
+                for window,raw in events:
+                    event=json.loads(raw)
+                    if self.get("watch-eof",window)!=event:
+                        continue
+                    self.delete("watch-eof",window)
+                    if event.get("account")!=account.get("generation"):
+                        continue
+                    media,total=event["media"],event["total"]
+                    scope=f"{account['id']}/{media}"
+                    cycle=self.get("cycle",scope)
+                    watch=self.get("watch",f"{scope}/{total}/{cycle.get('number',0)}")
+                    speed=max(event.get("speed",1),0.01)
+                    minimum=min(event["threshold"]*60, event["duration"]*.8/speed)
+                    if (watch.get("elapsed",0)<minimum or not watch.get("last_watched") or
+                        (not event.get("resume",True) and (watch.get("session")!=event.get("session") or watch.get("owner")!=window)) or
+                        watch.get("position",0)<event["duration"]-max(3,speed*2.5) or
+                        not 0 <= event["time"]-watch["last_watched"]/1000 <= 12):
+                        continue
+                    marker=cycle.get("rewatch")
+                    self.put("watch-finished",scope,dict(total=total,time=event["time"],
+                        session=event.get("session"),window=window,
+                        rewatch=bool(marker and cycle.get("phase") in ("ready","active")),
+                        repeat=marker[1] if marker else 0))
+        rows=self.db.execute("SELECT scope,value FROM records WHERE category='watch-finished' AND scope LIKE ?",
+                             (f"{account['id']}/%",)).fetchall()
+        for scope,raw in rows:
+            finished=json.loads(raw)
+            if finished.get("retry",0)>time.time() or self.get("write-intent",scope):
+                continue
+            with self.transaction():
+                if self.get("watch-finished",scope)!=finished:
+                    continue
+                self.put("watch-finished",scope,dict(finished,retry=time.time()+DAY))
+            try:
+                entry=read_entry(self.credential(account),account["id"],int(scope.split("/")[1]))
+            except AccountError:
+                continue
+            with serialized(self.directory), self.transaction():
+                current=self.get("watch-finished",scope)
+                if (self.get("account","current").get("generation")==account.get("generation") and
+                    current.get("time")==finished["time"] and not self.get("write-intent",scope)):
+                    self.clear_completed_watch(scope,entry)
+            break
 
     def delete(self, category, scope):
         self.db.execute(
@@ -211,8 +332,10 @@ class Worker:
             if not same_rewatch or (preparing and phase == "active"):
                 cycle["number"] = cycle.get("number", 0) + 1
                 self.clear_proposals(scope)
+                self.delete("watch-finished",scope)
             phase = "active" if repeating else "ready"
-            self.put("cycle", scope, dict(cycle, rewatch=marker, phase=phase))
+            if cycle.get("phase")!=phase or not same_rewatch:
+                self.put("cycle", scope, dict(cycle, rewatch=marker, phase=phase, activity=time.time()))
         elif (
             not (
                 same_rewatch
@@ -285,6 +408,7 @@ class Worker:
             })
             self.clear_proposals(scope)
             self.delete("write-intent", scope)
+            self.clear_completed_watch(scope, result, intent["player"].get("total", 0))
 
     def recover_write(self, account, scope, intent):
         base = intent["base"]
@@ -361,7 +485,7 @@ class Worker:
             if job.get("repeat_count") is not None:
                 expected["repeat"] = job["repeat_count"]
             intent = dict(
-                account=account, player={k: p[k] for k in ("media", "session", "episode", "tracking")},
+                account=account, player={k: p[k] for k in ("media", "session", "episode", "tracking", "total")},
                 key=proposal["key"] if proposal else self.cycle(account, p),
                 window=self.window, base=base, expected=expected,
                 keep_status=bool(proposal and job.get("keep_status") and
@@ -389,6 +513,7 @@ class Worker:
                 with self.transaction():
                     self.context(job, True)
                     self.remember_entry(account, p, exc.entry)
+                    self.clear_completed_watch(scope,exc.entry,p["total"])
                 self.reply(entry=dict(exc.entry, session=p["session"]), proposal=None)
                 raise
             self.finish_write(scope, intent, result)
@@ -477,7 +602,18 @@ class Worker:
         account, p = self.context(
             job, op in ("read", "write", "search", "select", "accept", "rearm")
         )
-        if op == "connect":
+        if op in ("export-settings", "import-settings"):
+            try:
+                if op == "export-settings":
+                    message = f"Exported {export_settings(self.db, job['path'])} settings records."
+                else:
+                    with self.transaction():
+                        message = import_summary(import_settings(self.db, job["path"]))
+                    self.tracking_probe = None
+            except (OSError, sqlite3.Error, ValueError, RecursionError) as exc:
+                raise AccountError(f"Settings transfer failed. {exc}") from exc
+            self.reply(message=message)
+        elif op == "connect":
             broker = self.settings.get("broker", "")
             if not broker and not self.settings.get("personal"):
                 if str(self.settings.get("client_id")) != "55822":
@@ -552,6 +688,8 @@ class Worker:
                                 "skipped",
                                 "entry",
                                 "cycle",
+                                "watch-finished",
+                                "watch-completed",
                             ]
                         for category in categories:
                             self.db.execute(
@@ -573,6 +711,7 @@ class Worker:
                     "Choose a matched anime and connect an account first."
                 )
             scope = f"{account['id']}/{p['media']}"
+            epoch = self.get("generation", "data")
             previous = self.get("entry", scope)
             cached = dict(previous, session=p["session"]) if previous else None
             self.reply(read_state="loading", entry=cached, offline=False)
@@ -586,7 +725,10 @@ class Worker:
                 raise
             with self.transaction():
                 self.context(job, True)
+                if self.get("generation", "data") != epoch:
+                    return
                 self.remember_entry(account, p, entry)
+                self.clear_completed_watch(scope, entry, p.get("total",0))
             notice = {} if job.get("quiet") else {"message": "Progress refreshed."}
             self.reply(
                 entry=dict(entry, session=p["session"]),
@@ -606,8 +748,10 @@ class Worker:
                 self.context(job, True)
                 scope = str(account["id"]) + "/" + str(p["media"])
                 cycle = self.get("cycle", scope)
-                self.put("cycle", scope, dict(cycle, number=cycle.get("number", 0) + 1))
+                self.put("cycle", scope, dict(cycle, number=cycle.get("number", 0) + 1, activity=time.time()))
                 self.clear_proposals(scope)
+                self.delete("watch-finished",scope)
+                self.delete("watch-completed",scope)
             self.previous = None
             self.tracking_probe = None
             self.reply(proposal=None, message="New viewing cycle started.")
@@ -654,6 +798,25 @@ class Worker:
                     self.put("skipped", key, {"skip": True})
                     self.delete("pending", key)
                 self.reply(proposal=None, message="Skipped.")
+        elif op == "sweep-watch":
+            self.sweep_watch(force=True)
+        elif op == "reset-watch":
+            with serialized(self.directory), self.transaction():
+                self.context(job)
+                self.db.execute(
+                    "DELETE FROM records WHERE category IN ('watch','cycle','history','pending','skipped',"
+                    "'entry','watch-finished','watch-completed','watch-eof','write-intent','watch-sweep') "
+                    "OR (category='job' AND json_extract(value,'$.op') IN ('read','write','accept','skip','rearm'))"
+                )
+                self.db.execute(
+                    "UPDATE records SET value=json_remove(value,'$.entry','$.proposal','$.read_state','$.last_read','$.last_write') "
+                    "WHERE category='response' AND (json_type(value,'$.entry') IS NOT NULL "
+                    "OR json_type(value,'$.proposal') IS NOT NULL OR json_type(value,'$.read_state') IS NOT NULL "
+                    "OR json_type(value,'$.last_read') IS NOT NULL OR json_type(value,'$.last_write') IS NOT NULL)"
+                )
+                self.put("generation", "data", {"id": secrets.token_hex(12)})
+            self.previous = self.tracking_probe = None
+            self.reply(message="Local watch data cleared.")
         elif op == "clear":
             category = job["category"]
             with serialized(self.directory), self.transaction():
@@ -670,6 +833,8 @@ class Worker:
                     "folder-filter",
                     "recognition-options",
                     "tv-rule",
+                    "watch-retention",
+                    "save-scopes",
                 ):
                     removed = self.get(category, job["scope"])
                     if category == "match" and job.get("field"):
@@ -1500,10 +1665,15 @@ class Worker:
         prev = self.previous
         key = (
             self.cycle(a, p)
-            if a.get("id") and p.get("watch_episode") and p.get("active")
+            if a.get("id") and p.get("watch_episode") and p.get("active") and
+            not self.completed_in_window(f"{a['id']}/{p['media']}",p)
             else None
         )
         self.previous = (p, a.get("generation"), key)
+        if self.data_generation != epoch:
+            self.data_generation = epoch
+            if prev:
+                return
         if not prev or not a.get("id") or not p.get("active") or key is None:
             return
         before, generation, previous_key = prev
@@ -1535,6 +1705,7 @@ class Worker:
                 or self.get("account", "current").get("generation") != a["generation"]
                 or self.get("player", self.window) != p
                 or self.cycle(a, p) != key
+                or self.completed_in_window(f"{a['id']}/{p['media']}",p)
             ):
                 self.previous = None
                 return
@@ -1587,6 +1758,8 @@ class Worker:
                     owner=self.window,
                     owner_time=p["time"],
                     session=p["session"],
+                    activity=p["wall"]/1000 if credit else watch.get("activity",p["wall"]/1000),
+                    position=p["pos"] if credit else watch.get("position",0),
                 ),
             )
         if credit and not credit_only:
@@ -1600,9 +1773,12 @@ class Worker:
         ):
             return
         self.expected = (a["generation"], p["session"])
+        epoch = self.get("generation", "data")
         episode = int(p["episode"])
         key = self.cycle(a, p)
         scope = f"{a['id']}/{p['media']}"
+        if self.completed_in_window(scope,p):
+            return
         if self.get("write-intent", scope):
             if time.monotonic() >= getattr(self, "recovery_retry", 0):
                 self.recovery_retry = time.monotonic() + 15
@@ -1626,7 +1802,6 @@ class Worker:
         enough_time = self.reached_threshold(p, watch)
         done = self.get("history", key) or self.get("skipped", key)
         job = dict(account=a["generation"], session=p["session"], media=p["media"])
-        epoch = self.get("generation", "data")
         prop = self.get("pending", key)
         review = (
             prop
@@ -1638,6 +1813,8 @@ class Worker:
         if ready:
             with self.transaction():
                 self.tracked_context(job, episode, key)
+                if self.get("generation", "data") != epoch:
+                    return
                 watch = self.get("watch", key)
                 if watch.get("retry", 0) > now:
                     ready = False
@@ -1670,6 +1847,7 @@ class Worker:
                                 title=p.get("match_title", ""),
                                 episode=episode,
                                 offline=True,
+                                activity=now,
                                 account=a["generation"],
                                 base={"session": p["session"]},
                             ),
@@ -1683,6 +1861,8 @@ class Worker:
             if epoch != self.get("generation", "data"):
                 return
             cached_entry = self.remember_entry(a, current, entry, prepare_rewatch=True)
+            if self.clear_completed_watch(scope,entry,current.get("total",0)):
+                return
             self.tracking_probe = (probe, float("inf"))
             if self.cycle(a, current) != key or not ready:
                 return
@@ -1759,6 +1939,7 @@ class Worker:
                 repeat_count=repeat_count,
                 start_rewatch=start_rewatch,
                 needs_review=mode == "ask" or not can_advance,
+                activity=now,
             )
             self.put("pending", key, prop)
 
@@ -1904,6 +2085,7 @@ class Worker:
                         self.expected = (job.get("account"), job.get("session"))
                     self.handle(job)
                 else:
+                    self.sweep_watch()
                     p = self.get("player", self.window)
                     if self.lookup_pool is None:
                         self.recognize(p)
@@ -1930,6 +2112,9 @@ class Worker:
                             retry_at=None
                     a = self.get("account", "current")
                     self.propose(a, p)
+                    if time.monotonic() >= getattr(self,"next_completion_check",0):
+                        self.next_completion_check=time.monotonic()+5
+                        self.finish_watched_episode()
             except AccountError as exc:
                 if isinstance(exc, SessionExpired) and self.expected:
                     with self.transaction():

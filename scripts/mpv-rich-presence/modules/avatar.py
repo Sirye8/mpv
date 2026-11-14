@@ -54,6 +54,7 @@ def main(address, pid):
              "--no-terminal", "--frames=1", "--vf=scale=64:64,format=bgra", "--of=rawvideo",
              "--ovc=rawvideo", f"--o={output}", "--", str(source)],
             timeout=8, check=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         pixels = bytearray(output.read_bytes())

@@ -61,11 +61,12 @@ return function(model)
     local mouse_section = model.compact and "rich-presence-ask" or "rich-presence-panel"
     local ui = {open=false, page="Menu", memory={}, stack={}, hits={}}
     local overlay, layout, refresh_timer, toast_timer, hover_timer, animation_timer
+    local dropdown_timer, pointer_action
     local last_frame, last_terminal
-    local keys, editing, pressed, hovered, tooltip, drag = {}
+    local keys, editing, pressed, hovered, tooltip, drag, dropdown = {}
     local stop_edit,controls
     local scale = 1
-    local motion = {shell=0, page=1, focus=1, hover=0, hint=0, scroll=0}
+    local motion = {shell=0, page=1, focus=1, hover=0, hint=0, scroll=0, dropdown=0}
     local tweens = {}
 
     local function dimensions()
@@ -193,8 +194,8 @@ return function(model)
                 local color = item.primary and theme.ink or (item.disabled and theme.muted or theme.accent)
                 draw_cell(ass,item,item.value,item.label_right+12,y+6+rise,item.value_right,14,color,content,true)
             end
-            if item.fn and item.toggle==nil and (item.adjust or not item.value or item.link) and not item.primary then
-                label(ass,r-10,y+4+rise,item.link and "↗" or "›",16,theme.accent,.8*content,9)
+            if item.fn and item.toggle==nil and (item.adjust or item.dropdown or not item.value or item.link) and not item.primary then
+                label(ass,r-10,y+4+rise,item.link and "↗" or item.dropdown and "⌄" or "›",16,theme.accent,.8*content,9)
             end
             if item.toggle~=nil then
                 local sx = r-46
@@ -214,6 +215,27 @@ return function(model)
             local scroll = layout.scroll
             box(ass,right-6,scroll.start,right-2,scroll.finish,theme.rim,.25*shell,2)
             box(ass,right-6,scroll.first,right-2,scroll.last,theme.accent,(drag and 1 or .8)*shell,2)
+        end
+        if layout.dropdown then
+            local popup=layout.dropdown
+            local open=motion.dropdown
+            local y_offset=math.floor((1-open)*(popup.above and 4 or -4)+.5)
+            local opacity=shell*open
+            box(ass,popup.x+1,popup.y+3+y_offset,popup.r+1,popup.b+4+y_offset,theme.black,.45*opacity,11)
+            box(ass,popup.x,popup.y+y_offset,popup.r,popup.b+y_offset,theme.hint,.99*opacity,11,.65*opacity)
+            for _,item in ipairs(popup.rows) do
+                local emphasis=item.focused and .95 or hovered==item.key and .65 or item.selected and .34 or 0
+                if emphasis>0 then box(ass,item.x,item.y+y_offset,item.r,item.b+y_offset,theme.focus,emphasis*opacity,7) end
+                local color=item.disabled and theme.muted or item.selected and theme.accent or theme.text
+                local item_opacity=item.disabled and .58*opacity or opacity
+                if item.selected then label(ass,item.x+8,item.y+6+y_offset,"✓",14,color,item_opacity) end
+                draw_cell(ass,item,item.display,item.x+29,item.y+5+y_offset,item.r-8,15,color,item_opacity,false,item.selected)
+            end
+            if popup.scroll then
+                local bar=popup.scroll
+                box(ass,popup.r-7,bar.start+y_offset,popup.r-3,bar.finish+y_offset,theme.rim,.30*opacity,2)
+                box(ass,popup.r-7,bar.first+y_offset,popup.r-3,bar.last+y_offset,theme.accent,.85*opacity,2)
+            end
         end
         if tooltip and motion.hint>0 then
             local tip = tooltip
@@ -384,9 +406,14 @@ return function(model)
         keys[#keys+1] = id
     end
 
+    local function cancel_dropdown_timer()
+        if dropdown_timer then dropdown_timer:kill(); dropdown_timer=nil end
+    end
+
     function ui.close()
         if not ui.open then return end
         ui.open=false
+        ui.dismiss_choices(false)
         if editing and editing.dialog and input.terminate then input.terminate() end
         if model.avatar then model.avatar() end
         if model.backdrop then model.backdrop() end
@@ -395,7 +422,7 @@ return function(model)
         mp.unobserve_property(ui.draw)
         mp.unobserve_property(ui.mouse_moved)
         unbind()
-        ui.stack,ui.hits,pressed,editing,drag = {},{},nil,nil,nil
+        ui.stack,ui.hits,pressed,editing,drag,dropdown = {},{},nil,nil,nil,nil
         model.closed()
         tweens={}
         if layout and overlay then animate("shell",motion.shell,0,.14) end
@@ -408,6 +435,7 @@ return function(model)
     end
 
     local function show_page(page, direction)
+        ui.dismiss_choices(false)
         if editing and stop_edit then stop_edit(false) end
         if model.changed then model.changed() end
         if layout then layout.direction=direction end
@@ -425,14 +453,49 @@ return function(model)
     end
 
     function ui.back()
+        if dropdown then ui.dismiss_choices(); return end
         if model.leaving then model.leaving(ui.page) end
         local page = table.remove(ui.stack)
         if page then show_page(page,-1) else ui.close() end
     end
 
+    function ui.dismiss_choices(redraw)
+        if not dropdown then return end
+        cancel_dropdown_timer()
+        dropdown=nil
+        if layout then layout.dropdown=nil end
+        motion.dropdown,tweens.dropdown=0,nil
+        pressed,drag=nil,nil
+        clear_hover(true)
+        if redraw~=false then ui.draw() end
+    end
+
+    function ui.choose(id, entries, on_select)
+        if dropdown and dropdown.id==id then ui.dismiss_choices(); return end
+        ui.dismiss_choices(false)
+        local focus
+        for i,entry in ipairs(entries) do
+            if not entry.disabled and (not focus or entry.selected) then focus=i end
+        end
+        dropdown={id=id,entries=entries,on_select=on_select,focus=focus or 1,top=1,reveal=true,mouse=pointer_action==true}
+        pressed,drag=nil,nil
+        clear_hover(true)
+        animate("dropdown",.12,1,.14)
+        ui.draw()
+    end
+
+    local function choose_entry(index)
+        local open=dropdown
+        local entry=open and open.entries[index]
+        if not entry or entry.disabled then return end
+        ui.dismiss_choices(false)
+        open.on_select(entry.value)
+        ui.draw()
+    end
+
     function ui.draw()
         if not ui.open or (editing and editing.dialog) then return end
-        local rows = model.rows(ui.page)
+        local rows=model.rows(ui.page)
         if editing then
             local found=false
             for i,row in ipairs(rows) do
@@ -463,6 +526,13 @@ return function(model)
             end
             local lines={ui.page}
             for i,row in ipairs(rows) do lines[#lines+1]=(i==mem.focus and "> " or "  ")..row.label end
+            if dropdown then
+                lines[#lines+1]=dropdown.id
+                for i,entry in ipairs(dropdown.entries) do
+                    lines[#lines+1]=(i==dropdown.focus and "> " or "  ")..
+                        (entry.selected and "✓ " or "")..entry.label..(entry.disabled and " (unavailable)" or "")
+                end
+            end
             if model.compact then lines[#lines+1]=model.footer().." · Esc" end
             local frame=table.concat(lines,"\n")
             if frame~=last_terminal then mp.set_property("term-status-msg",frame); last_terminal=frame end
@@ -484,11 +554,10 @@ return function(model)
         local bounds = {math.floor(left*scale),math.floor(top*scale),math.ceil(right*scale),math.ceil(bottom*scale)}
         if model.backdrop then
             theme=model.theme and model.theme() or default_theme
-            model.backdrop(bounds,16*scale,theme.blur,theme.strength)
+            model.backdrop(bounds,16*scale,theme.blur,theme.strength,theme.method)
         end
         local bounds_key = table.concat(bounds,":")
         if not layout or layout.bounds~=bounds_key then
-            mp.set_mouse_area(bounds[1],bounds[2],bounds[3],bounds[4],mouse_section)
             clear_hover(true)
             pressed=nil
         end
@@ -540,13 +609,13 @@ return function(model)
                 item=hit(layout.rows,pane+8,y,right-8,y+row_height,i,key,not row.disabled and row.run or nil,row.label,row.tip)
             end
             item.focused,item.disabled,item.primary,item.toggle,item.adjust,item.plain = mem.focus==i,row.disabled,row.primary,row.toggle,row.adjust,row.plain
-            item.editor=row.editor
+            item.editor,item.dropdown=row.editor,row.dropdown
             item.avatar=row.avatar
             local title,value=row.label:match("^(.-)   (.+)$")
             item.caption,item.value_text,item.link=title or row.label,value,row.link
             if item.stepper then value=nil end
             local label_left=item.x+(row.plain and 5 or 13)
-            local inset=row.avatar and 52 or (row.adjust or row.link or (item.fn and not value)) and 26 or 11
+            local inset=row.avatar and 52 or (row.adjust or row.dropdown or row.link or (item.fn and not value)) and 26 or 11
             item.label_right=item.r-inset
             if row.toggle~=nil then
                 item.label_right=item.r-49
@@ -560,14 +629,6 @@ return function(model)
                 item.value=display(value,14,value_space)
             end
             item.display=display(item.caption,15,item.label_right-label_left-6)
-        end
-        if model.avatar then
-            local avatar
-            for _,item in ipairs(layout.rows) do
-                if item.avatar then avatar=item; break end
-            end
-            model.avatar(avatar and avatar.avatar,avatar and math.floor((avatar.r-47)*scale),
-                avatar and math.floor((avatar.y+3)*scale),avatar and math.max(16,math.floor(23*scale)))
         end
         if editing then
             local mid=(pane+right)/2
@@ -600,6 +661,68 @@ return function(model)
             layout.scroll={first=first,last=first+size*shown/#rows,
                 start=top+45, finish=top+45+size, limit=#rows-shown+1, page_size=shown}
         end
+        if dropdown then
+            local anchor
+            for _,item in ipairs(layout.rows) do
+                if item.key=="row:"..dropdown.id then anchor=item; break end
+            end
+            if anchor then
+                local step, pad, gap = 30, 5, 2
+                local capacity=math.max(1,math.min(7,#dropdown.entries))
+                local below=math.max(0,math.floor((max_bottom-anchor.b-gap-pad*2)/step))
+                local above=math.max(0,math.floor((anchor.y-min_top-gap-pad*2)/step))
+                local upward=below<capacity and above>below
+                local visible=math.max(1,math.min(capacity,upward and above or below))
+                local size=visible*step+pad*2
+                local edge=anchor.r
+                local width=190
+                for _,entry in ipairs(dropdown.entries) do width=math.max(width,measure(entry.label,15)+56) end
+                width=math.min(width,anchor.r-anchor.x,320)
+                local y=upward and anchor.y-gap-size or anchor.b+gap
+                y=math.max(min_top,math.min(y,max_bottom-size))
+                local popup={x=edge-width,y=y,r=edge,b=y+size,above=upward,rows={},anchor=anchor}
+                layout.dropdown=popup
+                dropdown.limit=#dropdown.entries-visible+1
+                if dropdown.reveal then
+                    dropdown.top=math.max(dropdown.focus-visible+1,math.min(dropdown.top,dropdown.focus))
+                    dropdown.reveal=nil
+                end
+                dropdown.top=math.min(dropdown.top,dropdown.limit)
+                for i=dropdown.top,dropdown.top+visible-1 do
+                    local entry=dropdown.entries[i]
+                    local top=y+pad+(i-dropdown.top)*step
+                    local item=hit(popup.rows,popup.x+pad,top,edge-(dropdown.limit>1 and 11 or pad),top+step-1,
+                        i,"choice:"..i,not entry.disabled and function() choose_entry(i) end or nil,entry.label,entry.detail)
+                    item.display=display(entry.label,15,width-53)
+                    item.focused,item.selected,item.disabled=i==dropdown.focus,entry.selected,entry.disabled
+                end
+                if dropdown.limit>1 then
+                    local length=visible*step
+                    local first=y+pad+length*(dropdown.top-1)/#dropdown.entries
+                    popup.scroll={start=y+pad,finish=y+pad+length,first=first,
+                        last=first+length*visible/#dropdown.entries,limit=dropdown.limit,page_size=visible}
+                end
+            else ui.dismiss_choices(false) end
+        end
+        local popup=layout.dropdown
+        if popup then
+            bounds[2]=math.min(bounds[2],math.floor(popup.y*scale))
+            bounds[4]=math.max(bounds[4],math.ceil(popup.b*scale))
+        end
+        if model.avatar then
+            local avatar
+            for _,item in ipairs(layout.rows) do
+                if item.avatar and not (popup and popup.x<item.r-24 and popup.r>item.r-47
+                    and popup.y<item.y+26 and popup.b>item.y+3) then avatar=item; break end
+            end
+            model.avatar(avatar and avatar.avatar,avatar and math.floor((avatar.r-47)*scale),
+                avatar and math.floor((avatar.y+3)*scale),avatar and math.max(16,math.floor(23*scale)))
+        end
+        local mouse_bounds=table.concat(bounds,":")
+        if not previous or previous.mouse_bounds~=mouse_bounds then
+            mp.set_mouse_area(bounds[1],bounds[2],bounds[3],bounds[4],mouse_section)
+        end
+        layout.mouse_bounds=mouse_bounds
         if previous and previous.page==ui.page and previous.focus~=mem.id then animate("focus",.4,1,.11) end
         if tooltip then
             local updated
@@ -613,6 +736,20 @@ return function(model)
     end
 
     local function focus(delta)
+        if dropdown then
+            cancel_dropdown_timer()
+            dropdown.mouse=false
+            local entries=dropdown.entries
+            local i=math.max(1,math.min(#entries,dropdown.focus+delta))
+            local direction=delta<0 and -1 or 1
+            if math.abs(delta)>#entries then direction=-direction end
+            while entries[i] and entries[i].disabled do i=i+direction end
+            if entries[i] then dropdown.focus=i end
+            dropdown.reveal=true
+            clear_hover(true)
+            ui.draw()
+            return
+        end
         local mem=ui.memory[ui.page]
         clear_hover(false)
         mem.id=nil
@@ -622,48 +759,85 @@ return function(model)
     end
 
     local function activate(delta)
+        if dropdown then
+            if delta==-1 then ui.dismiss_choices() else choose_entry(dropdown.focus) end
+            return
+        end
         local mem=ui.memory[ui.page]
         mem.reveal=true
         local row=model.rows(ui.page)[mem.focus]
         if row and not row.disabled then
-            if delta and row.adjust then row.adjust(delta) elseif not delta and row.run then row.run() end
+            if delta and row.adjust then row.adjust(delta)
+            elseif row.run and (not delta or (delta==1 and row.dropdown)) then row.run() end
             ui.draw()
         end
     end
 
-    local function scroll_to(value)
-        local mem=ui.memory[ui.page]
-        local top=math.max(1,math.min(layout.scroll.limit,value))
+    local function scroll_to(value, popup)
+        local mem=popup and dropdown or ui.memory[ui.page]
+        local bar=popup and layout.dropdown.scroll or layout.scroll
+        local top=math.max(1,math.min(bar.limit,value))
         if top==mem.top then return end
         mem.top=top
         clear_hover(true)
         ui.draw()
     end
 
+    local function inside(item,x,y)
+        return item and x>=item.x and x<item.r and y>=item.y and y<item.b
+    end
+
+    local function watch_dropdown_pointer(near)
+        if not dropdown then return end
+        if near then cancel_dropdown_timer()
+        elseif dropdown.mouse and not dropdown_timer and not drag and not (pressed and pressed:match("^choice:")) then
+            dropdown_timer=mp.add_timeout(.32,function()
+                dropdown_timer=nil
+                ui.dismiss_choices()
+            end)
+        end
+    end
+
     local function pointer(event)
-        if not ui.open or (editing and editing.dialog) then return end
+        if not ui.open or not layout or (editing and editing.dialog) then return end
         local x,y=mp.get_mouse_pos()
         x,y=x/scale,y/scale
-        local bar=layout and layout.scroll
+        local popup=layout.dropdown
+        local in_popup=inside(popup,x,y)
+        local near=in_popup or (popup and x>=popup.x and x<popup.r and
+            y>=math.min(popup.y,popup.anchor.y) and y<math.max(popup.b,popup.anchor.b)) or
+            (popup and inside(popup.anchor,x,y))
+        if event=="hover" then
+            if in_popup then dropdown.mouse=true end
+            watch_dropdown_pointer(near)
+        end
+        local popup_bar=drag and drag.popup or (not drag and in_popup)
+        local bar=popup_bar and popup and popup.scroll or (not popup_bar and layout.scroll)
+        local edge=popup_bar and popup and popup.r or layout.right
         if drag then
             if event=="up" or drag.page~=ui.page or not bar then
                 drag=nil
                 render()
             elseif event=="hover" then
                 local travel=bar.finish-bar.start-(bar.last-bar.first)
-                if travel>0 then scroll_to(1+math.floor((y-bar.start-drag.offset)/travel*(bar.limit-1)+.5)) end
+                if travel>0 then scroll_to(1+math.floor((y-bar.start-drag.offset)/travel*(bar.limit-1)+.5),drag.popup) end
             end
             return
         end
-        if bar and x>=layout.right-8 and x<layout.right and y>=bar.start and y<=bar.finish then
+        if popup and not in_popup and event=="down" and not inside(popup.anchor,x,y) then
+            ui.dismiss_choices()
+            return
+        end
+        if bar and x>=edge-(popup_bar and 11 or 8) and x<edge and y>=bar.start and y<=bar.finish then
             if event=="down" then
                 pressed=nil
                 if y>=bar.first and y<bar.last then
-                    drag={page=ui.page,offset=y-bar.first}
+                    drag={page=ui.page,offset=y-bar.first,popup=popup_bar}
                     clear_hover(true)
                     render()
                 else
-                    scroll_to(ui.memory[ui.page].top+(y<bar.first and -bar.page_size or bar.page_size))
+                    local mem=popup_bar and dropdown or ui.memory[ui.page]
+                    scroll_to(mem.top+(y<bar.first and -bar.page_size or bar.page_size),popup_bar)
                 end
             elseif event=="hover" and hovered then
                 clear_hover(true)
@@ -672,12 +846,13 @@ return function(model)
             return
         end
         local target
-        for _,item in ipairs(ui.hits) do
-            if x>=item.x and x<item.r and y>=item.y and y<item.b then target=item; break end
+        for _,item in ipairs(in_popup and popup.rows or ui.hits) do
+            if inside(item,x,y) and (in_popup or not item.key:match("^choice:")) then target=item; break end
         end
         if editing and target and target.key~="save" and target.key~="cancel" then target=nil end
         local key=target and target.key
         if event=="hover" then
+            if popup and not in_popup then target,key=nil,nil end
             if key==hovered then return end
             clear_hover(false)
             hovered=key
@@ -702,8 +877,9 @@ return function(model)
                 end)
             end
         elseif event=="down" then
+            cancel_dropdown_timer()
             pressed=target and target.fn and key or nil
-            if pressed and type(target.id)=="number" then
+            if pressed and not in_popup and type(target.id)=="number" then
                 ui.memory[ui.page].focus=target.id
                 ui.memory[ui.page].id=nil
                 ui.draw()
@@ -714,20 +890,34 @@ return function(model)
             pressed=nil
             if target and clicked==key and target.fn then
                 clear_hover(true)
+                pointer_action=true
                 target.fn()
+                pointer_action=false
                 ui.draw()
                 return
             end
         end
+        if event=="up" then watch_dropdown_pointer(near) end
         render()
     end
 
     ui.mouse_moved=function(_,position)
-        if position and position.hover==false then drag=nil; clear_hover(false); render()
+        if position and position.hover==false then drag,pressed=nil,nil; watch_dropdown_pointer(false); clear_hover(false); render()
         else pointer("hover") end
     end
     local function scroll(delta)
         if editing then return end
+        local popup=layout and layout.dropdown
+        if popup then
+            local x,y=mp.get_mouse_pos()
+            if not inside(popup,x/scale,y/scale) and dropdown.mouse then ui.dismiss_choices(); return end
+            if not popup.scroll then return end
+            local accumulated=(dropdown.wheel or 0)+delta*3
+            local steps=accumulated>=0 and math.floor(accumulated) or math.ceil(accumulated)
+            dropdown.wheel=accumulated-steps
+            if steps~=0 then scroll_to(dropdown.top+steps,true) end
+            return
+        end
         if tooltip and tooltip.key==hovered and tooltip.max_scroll>0 then
             tooltip.scroll=math.max(0,math.min(tooltip.max_scroll,tooltip.scroll+delta*72))
             render()

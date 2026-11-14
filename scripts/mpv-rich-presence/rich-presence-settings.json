@@ -1,0 +1,33 @@
+{
+  "format": "mpv-rich-presence-settings",
+  "version": 1,
+  "records": [
+    {
+      "category": "panel-theme",
+      "scope": "global",
+      "value": {
+        "accent": "AFD9FF",
+        "background": "030405",
+        "blur": true,
+        "method": "gaussian",
+        "opacity": 90,
+        "preset": "custom",
+        "strength": 32
+      }
+    },
+    {
+      "category": "tracking",
+      "scope": "global",
+      "value": {
+        "mode": "ask",
+        "threshold": 12,
+        "ask_timing": "leave",
+        "ask_position": "top-right",
+        "ask_timeout": 60,
+        "rewatch": true,
+        "keep_pending": true,
+        "without_sharing": true
+      }
+    }
+  ]
+}
